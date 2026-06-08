@@ -1,9 +1,11 @@
 # Tasty-Planet-2-Level-Editor
 A level editor for the game Tasty Planet 2 with graphics integration to allow rendering of the game's sprites. Allows creation of new levels, and tweaking of existing.
 
-To use, simply launch `tp2editor.py` 
+Will of course require Python to run. You will need to run `pip install PySide6 Pillow` first.
 
-Will of course require Python to run. you will need to run `pip install PySide6 Pillow` as well.
+Then to use, Open the folder containing all the Python files, click the directory bar at the top of the file explorer window and type 'cmd'. 
+Then simply type `python tp2editor.py` into the command prompt.
+
 
 Thank you to RemagOfficial for their Tasty Planet 2 level editor, found at
 https://github.com/RemagOfficial/Tasty-Planet-2-level-editor
