@@ -23,7 +23,7 @@ ML_ATTRS = ['timelimit','victorytype','numspecialentities','goldtime','silvertim
             'bronzetime','smallfailstring','tipscriptfunction','comicstartfunction',
             'comicendfunction','levelmusicscript']
 LV_ATTRS = ['name','meterperpix','posx','posy','triggerarea','triggerspecial','gootostart']
-FLOAT_ATTRS = {'meterperpix','posx','posy'}   # written in scientific notation
+FLOAT_ATTRS = {'meterperpix','posx','posy'}   # written in scientific notation. I added a system for more readable values though.
 
 class Stage(dict):
     @property

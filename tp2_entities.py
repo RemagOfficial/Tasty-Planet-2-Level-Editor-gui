@@ -1,5 +1,5 @@
 # Authoritative TP2 entity table: (internal_name, display_name, theme)
-# Source: complete in-game list provided by the user. This is the canonical set of valid
+# Source: complete in-game list derived from existing files. This is the canonical set of valid
 # spawnable entity names plus their display labels and themes. Used by tp2assets for the
 # asset-browser catalog, display names, and theme categorization.
 

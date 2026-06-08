@@ -1,5 +1,5 @@
 """
-Tasty Planet asset resolver + sprite builder (headless, PIL only — no Qt).
+TP2 asset resolver + sprite builder (headless, PIL only — no Qt).
 
 Resolves a level-prop name to a tinted PIL RGBA sprite using the game's files:
     assets/graphics/<theme>imagemap<N>.jpg (+ ...mask.png)   texture atlases
@@ -92,17 +92,17 @@ class Assets:
             self._load_strings(st)
         # precompute prefix list for animation lookup
         self._anim_names=list(self.anims.keys())
-        # explicit entity->art aliases (entity name in level != art name, irreducibly)
+        # explicit entity->art aliases (entity name in level != art name, unfortunately)
         self.aliases={
             'scientist_young_lab1':'modern_sciyoung',
             'scientist_old_lab1':'modern_sciold',
-            'leaf':'cucumberleaf',     # theme-general leaf (dino levels may want 'mapleleaf')
+            'leaf':'cucumberleaf',
             'stoneblock1':'stone1',
             'galacticturtle':'turtles_all_the_way_down',
             'fabricspace':'turtle_tile',
             # giants are the star sprite, recolored via the entity's color (like grapes)
             'redgiant':'star', 'supergiant':'star', 'hypergiant':'star', 'hypergiant_moving':'star',
-            # planets: each a full planet cell, recolored. (best-guess gas/rocky split — verify in-game)
+            # planets: each a full planet cell, recolored.
             'neptune_future1':'planet_gas', 'jupiter_future1':'planet_gas_2',
             'saturn_future1':'planet_rings', 'mars_future1':'planet_rockey',
             'venus_future1':'planet_rockey', 'mercury_future1':'planet_rockey',
@@ -276,7 +276,7 @@ class Assets:
     def _base_cell(self, name, frame_i=0):
         name=self.aliases.get(name, name)
         # skeletal characters (modern_sciyoung, ...) have no single sprite; use the
-        # standing body part as a representative (full assembly is a future feature).
+        # standing body part as a representative (full assembly is a future feature I plan to do).
         if name+'_stand_body' in self.anims or name+'_walk_body' in self.anims:
             body=self.anims.get(name+'_stand_body') or self.anims.get(name+'_walk_body')
             if body and body.frames:

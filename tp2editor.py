@@ -1,21 +1,15 @@
-#!/usr/bin/env python3
 """
 Tasty Planet 2 level editor.
 
 Data layer: the correct community parser (read_level / write_level). The file is
-per-layer; each layer holds walls (collision), paths (splines), entities and
-decorations (the tile field). Positions are delta-encoded on disk; this editor keeps
+per-layer; each layer holds walls (collisions for player and entities), paths (splines for entities to follow), 
+entities and decorations (the background). Positions are delta-encoded on disk; this editor keeps
 absolute positions in the level dict and lets write_level re-encode on save (byte-exact).
 
-Decoration decode notes (verified against japansword1a):
+Decoration decode notes (verified using japansword1a.bin):
   * a decoration of type 0 reuses the PREVIOUS decoration's tile (run-length);
     type 1 carries a cell index into tileTypes, type 2 an inline name.
-  * the decoration 'size' field is a ROTATION (raw / 65536 * 360 degrees) — road
-    tiles rotate to follow the path, grass tiles get varied rotation.
-
-Co-locate: tp2editor.py read_level.py write_level.py tp2assets.py tp2multi.py
-plus imagemaps.xml / entityintersections.xml / animationdefs.xml + assets/graphics.
-Run:  pip install PySide6 Pillow   then   python tp2editor.py
+  * the decoration 'size' field is a ROTATION stored in centidegrees (-raw/100 = 90).
 """
 import sys, os, re, copy, math, glob, collections
 from PySide6.QtWidgets import (
@@ -42,12 +36,12 @@ TURN     = 65536.0    # raw -> 360 deg
 HIST_MAX = 40
 DEFAULT_GFX = r"C:\Program Files (x86)\Steam\steamapps\common\Tasty Planet Back for Seconds\assets\graphics"
 
-# ---- shared field specs (key, label, choices|None, tooltip) -----------------
+# shared field specs (key, label, choices|None, tooltip)
 # choices: list of (stored_value, display_text); None => free-text line edit.
 TF_CHOICES = [('false', 'false'), ('true', 'true')]
 VICTORY_CHOICES = [('0', '0 — reach a size'), ('1', '1 — collect objects'), ('2', '2 — no size meter')]
 
-STAGE_SPECS = [   # per-<level> attributes (excludes name; that's handled separately)
+STAGE_SPECS = [   # per-<level> attributes (excludes name, that's handled separately)
     ('triggerarea',    "Goal area — max size to reach", None,
         "Goo area that ends/transitions this stage (victory type 0). Bigger = grow larger to win."),
     ('meterperpix',    "Zoom (meterperpix)", None,
@@ -74,7 +68,7 @@ ML_SPECS = [      # multilevel-wide attributes
     ('smallfailstring',    "Fail message", None, "Text shown on failure."),
 ]
 
-# ---- create levels from scratch ---------------------------------------------
+# create levels from scratch
 def blank_level_dict():
     """A valid, empty level: 5 named layers, no tiles/walls/paths/entities/decorations."""
     return {'dummy': 0, 'tileTypeCount': 0, 'tileTypes': [], 'layerCount': 5,
@@ -118,7 +112,8 @@ def default_path_follow(name):
     return {'v0': 0.55, 'v1': 0.55, 'flag0': 0, 'v2': 0.5, 'v3': 2.0,
             'path_name': name, 'flag1': 0, 'mode': 1, 'v4': 1.0}
 
-# Path-follow parameters observed per creature type across the shipped levels.
+# Path-follow parameters.
+# Tested using various existing levels in the game and the parameters those entities use.
 # Across every follower: v0=v1=0.55, flag0=0, and v3 == 4*v2 hold; v2/mode/flag1/v4 vary by type.
 PF_FIELDS = ('v0', 'v1', 'flag0', 'v2', 'v3', 'flag1', 'mode', 'v4')
 GENERIC_PATH_FOLLOW = {'v0': 0.55, 'v1': 0.55, 'flag0': 0, 'v2': 0.5, 'v3': 2.0, 'flag1': 0, 'mode': 1, 'v4': 1.0}
@@ -137,7 +132,7 @@ TYPE_PATH_FOLLOW = {
 def make_path_follow(name, etype=None, level=None):
     """Build a path_follow block for an entity. Params are resolved best-first:
     (1) copy an existing same-type follower already in this level, (2) a per-type table
-    learned from the shipped levels, (3) a generic fallback."""
+    based on the existing levels, (3) a generic fallback."""
     params = None
     if level:
         for L in level.get('layers', []):
@@ -150,9 +145,9 @@ def make_path_follow(name, etype=None, level=None):
     params = dict(params); params['path_name'] = name
     return params
 
-# Emitter ("spawner") block: 11 doubles v0..v10, plus reserved+end_marker ints (stored only on
-# layers >= 3). Observed in shipped levels: v0=v1=1.0, v2=v7=v8=0 always; v9<v10 (a min/max pair);
-# end_marker 1..20; v4/v5/v6 are 0 or 0.05. Meanings below are HYPOTHESES to be tested in-game.
+# Emitter block: 11 doubles v0..v10, plus reserved+end_marker ints (stored only on
+# layers >= 3). based on existing levels: v0=v1=1.0, v2=v7=v8=0 always; v9<v10 (a min/max pair);
+# end_marker 1..20; v4/v5/v6 are 0 or 0.05. Meanings below are assumed, take with a grain of salt.
 GENERIC_EMITTER = {'v0': 1.0, 'v1': 1.0, 'v2': 0.0, 'v3': 0.0, 'v4': 0.0, 'v5': 0.0, 'v6': 0.0,
                    'v7': 0.0, 'v8': 0.0, 'v9': 5.0, 'v10': 10.0, 'reserved': 0, 'end_marker': 5}
 TYPE_EMITTER = {   # overlaid on top of GENERIC_EMITTER
@@ -192,7 +187,7 @@ def recompute_path(path):
     path['extent_x_guess'] = maxx - minx; path['extent_y_guess'] = maxy - miny
 
 
-# (field key, label, is_int, tooltip) — labels are best-guesses, flagged as such for testing.
+# (field key, label, is_int, tooltip) — labels are best-guesses.
 EMITTER_FIELDS = [
     ('end_marker', "count to spawn (?)", True,  "Guess: how many spawn before stopping (1..20 in game). Stored only on layers ≥ 3."),
     ('v9',  "interval min (?)",  False, "Guess: shortest gap between spawns."),
@@ -266,6 +261,7 @@ class Bus(QObject):
 
 
 def entity_render_scale(mass, w, h):
+    # Tested on lab2a, so this block references assets used there.
     """Area-based scale (rendered area = mass) with an elongation boost shaped like a hump:
     compact sprites (candy, oscilloscope) use the plain area model; the boost ramps up to BMAX
     at the caliper's aspect (~3.2), then decays for more-elongated sprites (test tube, eyedropper)
