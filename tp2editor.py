@@ -11,14 +11,14 @@ Decoration decode notes (verified using japansword1a.bin):
     type 1 carries a cell index into tileTypes, type 2 an inline name.
   * the decoration 'size' field is a ROTATION stored in centidegrees (-raw/100 = 90).
 """
-import sys, os, re, copy, math, glob, collections
+import sys, os, re, copy, math, glob, json, collections
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsScene, QGraphicsView, QGraphicsPixmapItem,
     QGraphicsPathItem, QGraphicsRectItem, QGraphicsEllipseItem, QDockWidget, QWidget,
     QVBoxLayout, QFormLayout, QHBoxLayout, QLabel, QPushButton, QDoubleSpinBox, QSpinBox, QCheckBox,
     QListWidget, QListWidgetItem, QFileDialog, QColorDialog, QLineEdit, QStyle, QFrame,
     QDialog, QGridLayout, QComboBox, QScrollArea, QToolButton, QGraphicsItemGroup,
-    QTableWidget, QTableWidgetItem, QHeaderView)
+    QTableWidget, QTableWidgetItem, QHeaderView, QMenu, QMessageBox)
 from PySide6.QtGui import (
     QPixmap, QImage, QColor, QPainter, QPen, QAction, QPainterPath, QFont, QPolygonF,
     QKeySequence, QIcon, QBrush)
@@ -35,6 +35,7 @@ DIM_BASE = 16000.0    # decoration dimensions raw -> scale 1.0
 TURN     = 65536.0    # raw -> 360 deg
 HIST_MAX = 40
 DEFAULT_GFX = r"C:\Program Files (x86)\Steam\steamapps\common\Tasty Planet Back for Seconds\assets\graphics"
+CONFIG_FILE = "editor_config.json"
 
 # shared field specs (key, label, choices|None, tooltip)
 # choices: list of (stored_value, display_text); None => free-text line edit.
@@ -613,12 +614,52 @@ class WallVertexHandle(QGraphicsRectItem):
 
 
 class Canvas(QGraphicsView):
-    def __init__(self, scene):
+    def __init__(self, scene, win):
         super().__init__(scene)
+        self.win = win
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setBackgroundBrush(QColor(BG))
+        self._panning = False
+        self._pan_last = None
+        self._drag_before_pan = QGraphicsView.RubberBandDrag
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MiddleButton:
+            self._panning = True
+            self._pan_last = e.pos()
+            self._drag_before_pan = self.dragMode()
+            self.setDragMode(QGraphicsView.NoDrag)
+            self.setCursor(Qt.ClosedHandCursor)
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._panning and self._pan_last is not None:
+            d = e.pos() - self._pan_last
+            self._pan_last = e.pos()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - d.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - d.y())
+            e.accept()
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MiddleButton and self._panning:
+            self._panning = False
+            self._pan_last = None
+            self.setDragMode(self._drag_before_pan)
+            self.setCursor(Qt.ArrowCursor)
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+    def contextMenuEvent(self, e):
+        self.win.open_canvas_context_menu(e.pos(), e.globalPos())
+        e.accept()
+
     def wheelEvent(self, e):
         s = 1.15 if e.angleDelta().y() > 0 else 1/1.15
         self.scale(s, s)
@@ -913,9 +954,11 @@ class MultiLevelDock(QDockWidget):
     def __init__(self, win):
         super().__init__("Multilevel builder", win); self.win = win
         self.ml = None; self.ml_path = None; self.cur = None
+        self._restoring_selection = False
         w = QWidget(); col = QVBoxLayout(w); col.setSpacing(8)
         col.addWidget(QLabel("Stages  (the <level> array — top plays first)"))
         self.list = QListWidget()
+        self.list.setMinimumHeight(130)   # enough room for about 3 visible stage rows
         self.list.currentRowChanged.connect(self._select)
         self.list.itemDoubleClicked.connect(lambda *_: self._open())
         col.addWidget(self.list)
@@ -930,6 +973,7 @@ class MultiLevelDock(QDockWidget):
         col.addLayout(rowb)
         self.open_btn = QPushButton("Open selected stage in editor"); self.open_btn.clicked.connect(self._open)
         col.addWidget(self.open_btn)
+
         # per-stage params
         col.addWidget(self._hline()); col.addWidget(self._h("Selected stage"))
         self.sform = QFormLayout(); sc = QWidget(); sc.setLayout(self.sform); col.addWidget(sc)
@@ -943,7 +987,12 @@ class MultiLevelDock(QDockWidget):
         b2 = QPushButton("Save As…"); b2.clicked.connect(self._save_as); srow.addWidget(b2)
         col.addLayout(srow)
         col.addStretch(1)
-        _sc = QScrollArea(); _sc.setWidgetResizable(True); _sc.setWidget(w); self.setWidget(_sc)
+
+        # Keep the full dock scrollable when space is tight, while still allowing splitter resizing.
+        _sc = QScrollArea()
+        _sc.setWidgetResizable(True)
+        _sc.setWidget(w)
+        self.setWidget(_sc)
         self.stage_edits = {}; self.ml_edits = {}
 
     @staticmethod
@@ -993,9 +1042,26 @@ class MultiLevelDock(QDockWidget):
 
     # ---- per-stage form ----
     def _select(self, idx):
+        if self._restoring_selection:
+            return
+        prev = self.cur
         self._commit_stage()                       # save edits from the previously-selected stage
         self.cur = idx if (self.ml and 0 <= idx < len(self.ml.stages)) else None
         self._build_stage_form()
+        if self.cur is None or not self.ml_path:
+            return
+        target = self.ml.stages[self.cur].get('name')
+        current = os.path.splitext(os.path.basename(self.win.path))[0] if self.win.path else None
+        if target == current:
+            return
+        if not self.win.load_stage(target, self.ml_path):
+            self._restoring_selection = True
+            self.list.blockSignals(True)
+            self.list.setCurrentRow(prev if prev is not None else -1)
+            self.list.blockSignals(False)
+            self._restoring_selection = False
+            self.cur = prev if (self.ml and prev is not None and 0 <= prev < len(self.ml.stages)) else None
+            self._build_stage_form()
 
     def _build_stage_form(self):
         while self.sform.rowCount(): self.sform.removeRow(0)
@@ -1032,7 +1098,7 @@ class MultiLevelDock(QDockWidget):
     # ---- array operations ----
     def _add_blank(self):
         if self.ml is None: self.win.statusBar().showMessage("open or start a multilevel first"); return
-        start = os.path.dirname(self.ml_path) if self.ml_path else ""
+        start = self.win._levels_dir()
         fn, _ = QFileDialog.getSaveFileName(self, "New blank level .bin", start, "Level (*.bin)")
         if not fn: return
         if not fn.lower().endswith(".bin"): fn += ".bin"
@@ -1047,7 +1113,7 @@ class MultiLevelDock(QDockWidget):
 
     def _add_existing(self):
         if self.ml is None: self.win.statusBar().showMessage("open or start a multilevel first"); return
-        start = os.path.dirname(self.ml_path) if self.ml_path else ""
+        start = self.win._levels_dir()
         fn, _ = QFileDialog.getOpenFileName(self, "Add existing level .bin", start, "Level (*.bin)")
         if not fn: return
         name = os.path.splitext(os.path.basename(fn))[0]
@@ -1086,11 +1152,12 @@ class MultiLevelDock(QDockWidget):
         try: self.ml.save(self.ml_path)
         except Exception as ex: self.win.statusBar().showMessage(f"save failed: {ex}"); return
         self.win.statusBar().showMessage(f"saved {os.path.basename(self.ml_path)}  ({len(self.ml.stages)} stages)")
+        self.win._push_recent('recent_multilevels', self.ml_path)
 
     def _save_as(self):
         if not self.ml: return
         self._flush()
-        start = self.ml_path or ""
+        start = self.ml_path or self.win._multilevels_dir()
         fn, _ = QFileDialog.getSaveFileName(self, "Save multilevel as", start, "Multilevel (*.xml)")
         if not fn: return
         if not fn.lower().endswith(".xml"): fn += ".xml"
@@ -1098,6 +1165,7 @@ class MultiLevelDock(QDockWidget):
         except Exception as ex: self.win.statusBar().showMessage(f"save failed: {ex}"); return
         self.ml_path = fn
         self.win.statusBar().showMessage(f"saved {os.path.basename(fn)}  ({len(self.ml.stages)} stages)")
+        self.win._push_recent('recent_multilevels', fn)
 
 
 class LevelSettings(QDialog):
@@ -1530,20 +1598,31 @@ class Main(QMainWindow):
         self._last_path = None
         self.bg_editable = False
         self.history = []; self.hist_idx = -1
-        self.gfx = DEFAULT_GFX if os.path.isdir(DEFAULT_GFX) else os.getcwd()
+        self._saved_level_state = None
+        self._cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILE)
+        self._cfg = self._load_config()
+        self._assets_root = self._load_assets_root()
+        self.gfx = self._graphics_dir()
         self.assets = self._load_assets(); self._pm = {}
-        self.scene = QGraphicsScene(self); self.view = Canvas(self.scene); self.setCentralWidget(self.view)
+        self._startup_prompt_done = False
+        self.scene = QGraphicsScene(self); self.view = Canvas(self.scene, self); self.setCentralWidget(self.view)
         self.inspector = Inspector(self); self.addDockWidget(Qt.RightDockWidgetArea, self.inspector)
         self.layers = LayersDock(self); self.addDockWidget(Qt.LeftDockWidgetArea, self.layers)
         self.mldock = MultiLevelDock(self); self.addDockWidget(Qt.LeftDockWidgetArea, self.mldock); self.mldock.hide()
         self.anim_t = 0.0; self.timer = QTimer(self); self.timer.timeout.connect(self._anim_step)
         self._menu(); self.scene.selectionChanged.connect(self._sel)
 
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        if not self._startup_prompt_done:
+            self._startup_prompt_done = True
+            QTimer.singleShot(0, self._maybe_prompt_reopen_last_level)
+
     def _load_assets(self):
         # the game XMLs aren't all in one place: imagemaps/entities/animations usually live in
-        # assets/graphics, but strings.xml lives in assets/. Search each file across candidate dirs.
+        # assets/graphics, while level XMLs live in assets/levels. Search the assets tree first.
         seen = set(); cands = []
-        for d in (self.gfx, os.path.dirname(self.gfx), os.path.dirname(os.path.dirname(self.gfx)),
+        for d in (self._graphics_dir(), self._assets_root, self._levels_dir(), self._multilevels_dir(),
                   os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
             if d and d not in seen:
                 seen.add(d); cands.append(d)
@@ -1559,12 +1638,144 @@ class Main(QMainWindow):
                    animations=find("animationdefs.xml"), strings=find("strings.xml"))
         return a
 
+    def _default_assets_root(self):
+        root = os.path.dirname(DEFAULT_GFX)
+        return root if os.path.isdir(root) else os.getcwd()
+
+    def _validate_assets_root(self, root):
+        return (isinstance(root, str) and os.path.isdir(root) and
+                os.path.isdir(os.path.join(root, 'graphics')) and
+                os.path.isdir(os.path.join(root, 'levels')))
+
+    def _graphics_dir(self):
+        return os.path.join(self._assets_root, 'graphics') if self._assets_root else os.getcwd()
+
+    def _levels_dir(self):
+        return os.path.join(self._assets_root, 'levels') if self._assets_root else os.getcwd()
+
+    def _multilevels_dir(self):
+        return os.path.join(self._levels_dir(), 'multilevels') if self._assets_root else os.getcwd()
+
+    def _load_assets_root(self):
+        saved_root = self._cfg.get('assets_root')
+        if self._validate_assets_root(saved_root):
+            if self._cfg.pop('graphics_path', None) is not None:
+                self._save_config()
+            return saved_root
+        legacy = self._cfg.get('graphics_path')
+        if self._validate_assets_root(legacy):
+            self._cfg.pop('graphics_path', None)
+            self._save_setting('assets_root', legacy)
+            return legacy
+        if saved_root or legacy:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Warning)
+            msg.setWindowTitle("Assets folder reset")
+            msg.setText("The saved assets folder is no longer valid for this editor.")
+            msg.setInformativeText("Please choose the game's assets folder again. The setting has been reset.")
+            msg.exec()
+        self._cfg.pop('graphics_path', None)
+        root = self._default_assets_root()
+        if self._validate_assets_root(root):
+            self._save_setting('assets_root', root)
+            return root
+        self._cfg.pop('assets_root', None)
+        self._save_config()
+        return os.getcwd()
+
+    def _load_config(self):
+        if not os.path.isfile(self._cfg_path):
+            return {}
+        try:
+            with open(self._cfg_path, encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_config(self):
+        try:
+            with open(self._cfg_path, 'w', encoding='utf-8') as f:
+                json.dump(self._cfg, f, indent=2)
+        except OSError:
+            pass
+
+    def _save_setting(self, key, value):
+        self._cfg[key] = value
+        self._save_config()
+
+    def _recent_list(self, key):
+        items = self._cfg.get(key, [])
+        if not isinstance(items, list):
+            return []
+        out = []
+        seen = set()
+        for path in items:
+            if isinstance(path, str) and path and path not in seen:
+                out.append(path)
+                seen.add(path)
+        return out[:5]
+
+    def _push_recent(self, key, path):
+        if not path:
+            return
+        items = self._recent_list(key)
+        items = [p for p in items if os.path.normcase(p) != os.path.normcase(path)]
+        items.insert(0, path)
+        self._save_setting(key, items[:5])
+
+    def _maybe_prompt_reopen_last_level(self):
+        if not self._validate_assets_root(self._assets_root):
+            return
+        recent = self._recent_list('recent_levels')
+        if not recent:
+            return
+        fn = recent[0]
+        if not fn or not os.path.isfile(fn):
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Reopen last level?")
+        box.setText(f"Reopen the last level you edited?\n\n{os.path.basename(fn)}")
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.Yes)
+        if box.exec() == QMessageBox.Yes:
+            self._load(fn)
+
+    def _recent_label(self, path):
+        base = os.path.basename(path)
+        folder = os.path.basename(os.path.dirname(path))
+        return f"{base}  [{folder}]" if folder else base
+
     def sprite_pixmap(self, name, rgba, frame):
         key = (name, rgba, frame)
         if key not in self._pm:
             spr = self.assets.build_sprite(name, rgba, frame)
             self._pm[key] = pil_to_qpixmap(spr) if spr is not None else None
         return self._pm[key]
+
+    def _mark_level_saved(self):
+        self._saved_level_state = copy.deepcopy(self.level) if self.level is not None else None
+
+    def has_unsaved_level_changes(self):
+        return self.level is not None and self._saved_level_state is not None and self.level != self._saved_level_state
+
+    def confirm_level_switch(self):
+        if not self.has_unsaved_level_changes():
+            return True
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle("Unsaved changes")
+        msg.setText("The current level has unsaved changes.")
+        msg.setInformativeText("Do you want to save before loading another level?")
+        msg.setStandardButtons(QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
+        msg.setDefaultButton(QMessageBox.Save)
+        choice = msg.exec()
+        if choice == QMessageBox.Cancel:
+            return False
+        if choice == QMessageBox.Discard:
+            return True
+        return self.save_bin()
 
     def resolve_deco_names(self, layer):
         """type 0 inherits previous tile; type 1 -> tileTypes[cell]; type 2 -> inline string."""
@@ -1602,12 +1813,14 @@ class Main(QMainWindow):
             if sc: a.setShortcut(sc)
             menu.addAction(a); return a
         m = self.menuBar().addMenu("&File")
+        self._recent_level_menu = m.addMenu("Open recent level")
+        self._recent_multilevel_menu = m.addMenu("Open recent multilevel")
         act(m, "Open .bin…", self.open_bin, "Ctrl+O")
         act(m, "Open multilevel…", self.open_multilevel)
         m.addSeparator()
         act(m, "New blank level…", self.new_level, "Ctrl+N")
         act(m, "New multilevel…", self.new_multilevel)
-        act(m, "Set graphics folder…", self.set_gfx); m.addSeparator()
+        act(m, "Set assets folder…", self.set_gfx); m.addSeparator()
         act(m, "Save .bin", self.save_bin, "Ctrl+S"); act(m, "Save .bin As…", self.save_bin_as)
         e = self.menuBar().addMenu("&Edit")
         act(e, "Undo", self.undo, QKeySequence.Undo)
@@ -1651,6 +1864,25 @@ class Main(QMainWindow):
         act(w, "Asset Browser", self.open_asset_browser, "Ctrl+B")
         act(w, "Entity Report", self.open_entity_report, "Ctrl+R")
         act(w, "Level Settings…", self.open_level_settings, "Ctrl+L")
+
+        m.aboutToShow.connect(self._refresh_recent_menus)
+
+    def _refresh_recent_menus(self):
+        def rebuild(menu, key, open_fn, empty_text):
+            menu.clear()
+            items = self._recent_list(key)
+            if not items:
+                placeholder = QAction(empty_text, self)
+                placeholder.setEnabled(False)
+                menu.addAction(placeholder)
+                return
+            for path in items:
+                a = QAction(self._recent_label(path), self)
+                a.setToolTip(path)
+                a.triggered.connect(lambda _=False, p=path, fn=open_fn: fn(p))
+                menu.addAction(a)
+        rebuild(self._recent_level_menu, 'recent_levels', self.open_recent_level, 'No recent levels')
+        rebuild(self._recent_multilevel_menu, 'recent_multilevels', self.open_recent_multilevel, 'No recent multilevels')
 
     def open_asset_browser(self):
         if getattr(self, "_browser", None) is None:
@@ -1697,6 +1929,39 @@ class Main(QMainWindow):
     def _kind_of(self, item):
         if isinstance(item, WallItem): return 'walls'
         return 'entities' if isinstance(item, EntityItem) else 'decorations'
+
+    def open_canvas_context_menu(self, view_pos, global_pos):
+        if self.level is None:
+            return
+        scene_pos = self.view.mapToScene(view_pos)
+        hits = self.scene.items(scene_pos)
+        ent = next((it for it in hits if isinstance(it, EntityItem)), None)
+        can_paste = bool(getattr(self, '_clip', None))
+        menu = QMenu(self)
+        if ent is not None:
+            self.scene.clearSelection()
+            ent.setSelected(True)
+            self.inspector.bind(ent)
+            copy_act = menu.addAction("Copy")
+            dup_act = menu.addAction("Duplicate")
+            del_act = menu.addAction("Delete")
+            menu.addSeparator()
+            paste_act = menu.addAction("Paste")
+            paste_act.setEnabled(can_paste)
+            picked = menu.exec(global_pos)
+            if picked is copy_act:
+                self.copy_selection()
+            elif picked is dup_act:
+                self.duplicate_selection()
+            elif picked is del_act:
+                self.delete_selection()
+            elif picked is paste_act:
+                self.paste_clipboard()
+            return
+        paste_act = menu.addAction("Paste")
+        paste_act.setEnabled(can_paste)
+        if menu.exec(global_pos) is paste_act:
+            self.paste_clipboard()
 
     def _bake_follower(self, layer, idx):
         """A decoration with type 0 inherits the PREVIOUS tile's sprite. Before removing the
@@ -1936,8 +2201,19 @@ class Main(QMainWindow):
         return (None, None, None)
 
     def open_bin(self):
-        fn, _ = QFileDialog.getOpenFileName(self, "Open level .bin", "", "Level (*.bin)")
-        if fn: self._load(fn)
+        fn, _ = QFileDialog.getOpenFileName(self, "Open level .bin", self._levels_dir(), "Level (*.bin)")
+        if fn:
+            self._load(fn)
+            self._push_recent('recent_levels', fn)
+
+    def open_recent_level(self, fn):
+        if not fn or not os.path.isfile(fn):
+            self.statusBar().showMessage(f"recent level not found: {fn}")
+            return
+        if not self.confirm_level_switch():
+            return
+        self._load(fn)
+        self._push_recent('recent_levels', fn)
 
     def _load(self, fn):
         self.path = fn; self.level = read_level(fn)
@@ -1956,32 +2232,68 @@ class Main(QMainWindow):
         self._populate(refit=True)
         if self._onion_on:                                  # rebuild ghost for the newly-loaded stage
             self._load_onion_data(); self._refresh_onion()
+        self._mark_level_saved()
     def set_gfx(self):
-        d = QFileDialog.getExistingDirectory(self, "Select assets/graphics folder", self.gfx)
+        d = QFileDialog.getExistingDirectory(self, "Select game assets folder", self._assets_root)
         if not d: return
-        self.gfx = d; self.assets = self._load_assets(); self._pm.clear()
+        if not self._validate_assets_root(d):
+            QMessageBox.warning(self, "Invalid assets folder",
+                                "Choose the game's assets folder that contains both 'graphics' and 'levels'.")
+            return
+        self._assets_root = d
+        self.gfx = self._graphics_dir()
+        self._cfg.pop('graphics_path', None)
+        self.assets = self._load_assets(); self._pm.clear()
+        self._save_setting('assets_root', d)
         if self.level: self._populate(refit=False)
 
     def save_bin(self):
-        if not self.level: return
+        if not self.level: return False
         if not self.path: return self.save_bin_as()
         write_level(self.level, self.path); self.statusBar().showMessage(f"saved {self.path}")
+        self._mark_level_saved()
+        self._push_recent('recent_levels', self.path)
+        return True
     def save_bin_as(self):
-        if not self.level: return
-        fn, _ = QFileDialog.getSaveFileName(self, "Save .bin", self.path or "", "Level (*.bin)")
-        if fn: self.path = fn; self.save_bin()
+        if not self.level: return False
+        fn, _ = QFileDialog.getSaveFileName(self, "Save .bin", self.path or self._levels_dir(), "Level (*.bin)")
+        if not fn:
+            return False
+        self.path = fn
+        ok = self.save_bin()
+        if ok:
+            self._push_recent('recent_levels', fn)
+        return ok
 
     def open_multilevel(self):
-        fn, _ = QFileDialog.getOpenFileName(self, "Open multilevel", "", "Multilevel (*.xml)")
+        fn, _ = QFileDialog.getOpenFileName(self, "Open multilevel", self._multilevels_dir(), "Multilevel (*.xml)")
         if not fn: return
         try: ml = TM.MultiLevel(fn)
         except Exception as ex: self.statusBar().showMessage(f"not a multilevel: {ex}"); return
         self.mldock.load(ml, fn)
-        if ml.stages: self.load_stage(ml.stages[0]['name'], fn)
+        if ml.stages:
+            if not self.load_stage(ml.stages[0]['name'], fn):
+                return
+        self._push_recent('recent_multilevels', fn)
+
+    def open_recent_multilevel(self, fn):
+        if not fn or not os.path.isfile(fn):
+            self.statusBar().showMessage(f"recent multilevel not found: {fn}")
+            return
+        if not self.confirm_level_switch():
+            return
+        try: ml = TM.MultiLevel(fn)
+        except Exception as ex:
+            self.statusBar().showMessage(f"not a multilevel: {ex}"); return
+        self.mldock.load(ml, fn)
+        if ml.stages:
+            if not self.load_stage(ml.stages[0]['name'], fn):
+                return
+        self._push_recent('recent_multilevels', fn)
 
     def new_level(self):
         """Create a fresh blank .bin + .xml shell and open it for editing."""
-        fn, _ = QFileDialog.getSaveFileName(self, "New blank level .bin", "", "Level (*.bin)")
+        fn, _ = QFileDialog.getSaveFileName(self, "New blank level .bin", self._levels_dir(), "Level (*.bin)")
         if not fn: return
         if not fn.lower().endswith(".bin"): fn += ".bin"
         try:
@@ -2003,11 +2315,16 @@ class Main(QMainWindow):
             p = os.path.join(c, name + ".bin")
             if os.path.isfile(p): return p
     def load_stage(self, name, ml_path):
+        if not self.confirm_level_switch():
+            return False
         p = self._resolve_stage(name, ml_path)
         if not p:
-            p, _ = QFileDialog.getOpenFileName(self, f"Locate {name}.bin", os.path.dirname(ml_path), "Level (*.bin)")
-            if not p: return
-        self._load(p); self.statusBar().showMessage(f"editing stage {name}")
+            p, _ = QFileDialog.getOpenFileName(self, f"Locate {name}.bin", self._levels_dir(), "Level (*.bin)")
+            if not p: return False
+        self._load(p)
+        self._push_recent('recent_levels', p)
+        self.statusBar().showMessage(f"editing stage {name}")
+        return True
 
     # ---- history ----
     def commit(self):
