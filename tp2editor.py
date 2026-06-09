@@ -11,7 +11,7 @@ Decoration decode notes (verified using japansword1a.bin):
     type 1 carries a cell index into tileTypes, type 2 an inline name.
   * the decoration 'size' field is a ROTATION stored in centidegrees (-raw/100 = 90).
 """
-import sys, os, re, copy, math, glob, collections
+import sys, os, re, copy, math, glob, json, collections
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsScene, QGraphicsView, QGraphicsPixmapItem,
     QGraphicsPathItem, QGraphicsRectItem, QGraphicsEllipseItem, QDockWidget, QWidget,
@@ -35,6 +35,7 @@ DIM_BASE = 16000.0    # decoration dimensions raw -> scale 1.0
 TURN     = 65536.0    # raw -> 360 deg
 HIST_MAX = 40
 DEFAULT_GFX = r"C:\Program Files (x86)\Steam\steamapps\common\Tasty Planet Back for Seconds\assets\graphics"
+CONFIG_FILE = "editor_config.json"
 
 # shared field specs (key, label, choices|None, tooltip)
 # choices: list of (stored_value, display_text); None => free-text line edit.
@@ -1570,7 +1571,13 @@ class Main(QMainWindow):
         self._last_path = None
         self.bg_editable = False
         self.history = []; self.hist_idx = -1
-        self.gfx = DEFAULT_GFX if os.path.isdir(DEFAULT_GFX) else os.getcwd()
+        self._cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILE)
+        self._cfg = self._load_config()
+        saved_gfx = self._cfg.get('graphics_path')
+        if isinstance(saved_gfx, str) and os.path.isdir(saved_gfx):
+            self.gfx = saved_gfx
+        else:
+            self.gfx = DEFAULT_GFX if os.path.isdir(DEFAULT_GFX) else os.getcwd()
         self.assets = self._load_assets(); self._pm = {}
         self.scene = QGraphicsScene(self); self.view = Canvas(self.scene, self); self.setCentralWidget(self.view)
         self.inspector = Inspector(self); self.addDockWidget(Qt.RightDockWidgetArea, self.inspector)
@@ -1598,6 +1605,27 @@ class Main(QMainWindow):
         a = Assets(self.gfx, imagemaps=im, entities=find("entityintersections.xml"),
                    animations=find("animationdefs.xml"), strings=find("strings.xml"))
         return a
+
+    def _load_config(self):
+        if not os.path.isfile(self._cfg_path):
+            return {}
+        try:
+            with open(self._cfg_path, encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_config(self):
+        try:
+            with open(self._cfg_path, 'w', encoding='utf-8') as f:
+                json.dump(self._cfg, f, indent=2)
+        except OSError:
+            pass
+
+    def _save_setting(self, key, value):
+        self._cfg[key] = value
+        self._save_config()
 
     def sprite_pixmap(self, name, rgba, frame):
         key = (name, rgba, frame)
@@ -2033,6 +2061,7 @@ class Main(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "Select assets/graphics folder", self.gfx)
         if not d: return
         self.gfx = d; self.assets = self._load_assets(); self._pm.clear()
+        self._save_setting('graphics_path', d)
         if self.level: self._populate(refit=False)
 
     def save_bin(self):
