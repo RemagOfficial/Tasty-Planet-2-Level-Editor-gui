@@ -1604,12 +1604,19 @@ class Main(QMainWindow):
         self._assets_root = self._load_assets_root()
         self.gfx = self._graphics_dir()
         self.assets = self._load_assets(); self._pm = {}
+        self._startup_prompt_done = False
         self.scene = QGraphicsScene(self); self.view = Canvas(self.scene, self); self.setCentralWidget(self.view)
         self.inspector = Inspector(self); self.addDockWidget(Qt.RightDockWidgetArea, self.inspector)
         self.layers = LayersDock(self); self.addDockWidget(Qt.LeftDockWidgetArea, self.layers)
         self.mldock = MultiLevelDock(self); self.addDockWidget(Qt.LeftDockWidgetArea, self.mldock); self.mldock.hide()
         self.anim_t = 0.0; self.timer = QTimer(self); self.timer.timeout.connect(self._anim_step)
         self._menu(); self.scene.selectionChanged.connect(self._sel)
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        if not self._startup_prompt_done:
+            self._startup_prompt_done = True
+            QTimer.singleShot(0, self._maybe_prompt_reopen_last_level)
 
     def _load_assets(self):
         # the game XMLs aren't all in one place: imagemaps/entities/animations usually live in
@@ -1716,6 +1723,24 @@ class Main(QMainWindow):
         items = [p for p in items if os.path.normcase(p) != os.path.normcase(path)]
         items.insert(0, path)
         self._save_setting(key, items[:5])
+
+    def _maybe_prompt_reopen_last_level(self):
+        if not self._validate_assets_root(self._assets_root):
+            return
+        recent = self._recent_list('recent_levels')
+        if not recent:
+            return
+        fn = recent[0]
+        if not fn or not os.path.isfile(fn):
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Reopen last level?")
+        box.setText(f"Reopen the last level you edited?\n\n{os.path.basename(fn)}")
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.Yes)
+        if box.exec() == QMessageBox.Yes:
+            self._load(fn)
 
     def _recent_label(self, path):
         base = os.path.basename(path)
