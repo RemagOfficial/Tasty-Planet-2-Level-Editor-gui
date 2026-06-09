@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QFormLayout, QHBoxLayout, QLabel, QPushButton, QDoubleSpinBox, QSpinBox, QCheckBox,
     QListWidget, QListWidgetItem, QFileDialog, QColorDialog, QLineEdit, QStyle, QFrame,
     QDialog, QGridLayout, QComboBox, QScrollArea, QToolButton, QGraphicsItemGroup,
-    QTableWidget, QTableWidgetItem, QHeaderView)
+    QTableWidget, QTableWidgetItem, QHeaderView, QMenu)
 from PySide6.QtGui import (
     QPixmap, QImage, QColor, QPainter, QPen, QAction, QPainterPath, QFont, QPolygonF,
     QKeySequence, QIcon, QBrush)
@@ -613,12 +613,52 @@ class WallVertexHandle(QGraphicsRectItem):
 
 
 class Canvas(QGraphicsView):
-    def __init__(self, scene):
+    def __init__(self, scene, win):
         super().__init__(scene)
+        self.win = win
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setBackgroundBrush(QColor(BG))
+        self._panning = False
+        self._pan_last = None
+        self._drag_before_pan = QGraphicsView.RubberBandDrag
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MiddleButton:
+            self._panning = True
+            self._pan_last = e.pos()
+            self._drag_before_pan = self.dragMode()
+            self.setDragMode(QGraphicsView.NoDrag)
+            self.setCursor(Qt.ClosedHandCursor)
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._panning and self._pan_last is not None:
+            d = e.pos() - self._pan_last
+            self._pan_last = e.pos()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - d.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - d.y())
+            e.accept()
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MiddleButton and self._panning:
+            self._panning = False
+            self._pan_last = None
+            self.setDragMode(self._drag_before_pan)
+            self.setCursor(Qt.ArrowCursor)
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+    def contextMenuEvent(self, e):
+        self.win.open_canvas_context_menu(e.pos(), e.globalPos())
+        e.accept()
+
     def wheelEvent(self, e):
         s = 1.15 if e.angleDelta().y() > 0 else 1/1.15
         self.scale(s, s)
@@ -1532,7 +1572,7 @@ class Main(QMainWindow):
         self.history = []; self.hist_idx = -1
         self.gfx = DEFAULT_GFX if os.path.isdir(DEFAULT_GFX) else os.getcwd()
         self.assets = self._load_assets(); self._pm = {}
-        self.scene = QGraphicsScene(self); self.view = Canvas(self.scene); self.setCentralWidget(self.view)
+        self.scene = QGraphicsScene(self); self.view = Canvas(self.scene, self); self.setCentralWidget(self.view)
         self.inspector = Inspector(self); self.addDockWidget(Qt.RightDockWidgetArea, self.inspector)
         self.layers = LayersDock(self); self.addDockWidget(Qt.LeftDockWidgetArea, self.layers)
         self.mldock = MultiLevelDock(self); self.addDockWidget(Qt.LeftDockWidgetArea, self.mldock); self.mldock.hide()
@@ -1697,6 +1737,39 @@ class Main(QMainWindow):
     def _kind_of(self, item):
         if isinstance(item, WallItem): return 'walls'
         return 'entities' if isinstance(item, EntityItem) else 'decorations'
+
+    def open_canvas_context_menu(self, view_pos, global_pos):
+        if self.level is None:
+            return
+        scene_pos = self.view.mapToScene(view_pos)
+        hits = self.scene.items(scene_pos)
+        ent = next((it for it in hits if isinstance(it, EntityItem)), None)
+        can_paste = bool(getattr(self, '_clip', None))
+        menu = QMenu(self)
+        if ent is not None:
+            self.scene.clearSelection()
+            ent.setSelected(True)
+            self.inspector.bind(ent)
+            copy_act = menu.addAction("Copy")
+            dup_act = menu.addAction("Duplicate")
+            del_act = menu.addAction("Delete")
+            menu.addSeparator()
+            paste_act = menu.addAction("Paste")
+            paste_act.setEnabled(can_paste)
+            picked = menu.exec(global_pos)
+            if picked is copy_act:
+                self.copy_selection()
+            elif picked is dup_act:
+                self.duplicate_selection()
+            elif picked is del_act:
+                self.delete_selection()
+            elif picked is paste_act:
+                self.paste_clipboard()
+            return
+        paste_act = menu.addAction("Paste")
+        paste_act.setEnabled(can_paste)
+        if menu.exec(global_pos) is paste_act:
+            self.paste_clipboard()
 
     def _bake_follower(self, layer, idx):
         """A decoration with type 0 inherits the PREVIOUS tile's sprite. Before removing the
