@@ -1152,6 +1152,7 @@ class MultiLevelDock(QDockWidget):
         try: self.ml.save(self.ml_path)
         except Exception as ex: self.win.statusBar().showMessage(f"save failed: {ex}"); return
         self.win.statusBar().showMessage(f"saved {os.path.basename(self.ml_path)}  ({len(self.ml.stages)} stages)")
+        self.win._push_recent('recent_multilevels', self.ml_path)
 
     def _save_as(self):
         if not self.ml: return
@@ -1164,6 +1165,7 @@ class MultiLevelDock(QDockWidget):
         except Exception as ex: self.win.statusBar().showMessage(f"save failed: {ex}"); return
         self.ml_path = fn
         self.win.statusBar().showMessage(f"saved {os.path.basename(fn)}  ({len(self.ml.stages)} stages)")
+        self.win._push_recent('recent_multilevels', fn)
 
 
 class LevelSettings(QDialog):
@@ -1653,6 +1655,31 @@ class Main(QMainWindow):
         self._cfg[key] = value
         self._save_config()
 
+    def _recent_list(self, key):
+        items = self._cfg.get(key, [])
+        if not isinstance(items, list):
+            return []
+        out = []
+        seen = set()
+        for path in items:
+            if isinstance(path, str) and path and path not in seen:
+                out.append(path)
+                seen.add(path)
+        return out[:5]
+
+    def _push_recent(self, key, path):
+        if not path:
+            return
+        items = self._recent_list(key)
+        items = [p for p in items if os.path.normcase(p) != os.path.normcase(path)]
+        items.insert(0, path)
+        self._save_setting(key, items[:5])
+
+    def _recent_label(self, path):
+        base = os.path.basename(path)
+        folder = os.path.basename(os.path.dirname(path))
+        return f"{base}  [{folder}]" if folder else base
+
     def sprite_pixmap(self, name, rgba, frame):
         key = (name, rgba, frame)
         if key not in self._pm:
@@ -1719,6 +1746,8 @@ class Main(QMainWindow):
             if sc: a.setShortcut(sc)
             menu.addAction(a); return a
         m = self.menuBar().addMenu("&File")
+        self._recent_level_menu = m.addMenu("Open recent level")
+        self._recent_multilevel_menu = m.addMenu("Open recent multilevel")
         act(m, "Open .bin…", self.open_bin, "Ctrl+O")
         act(m, "Open multilevel…", self.open_multilevel)
         m.addSeparator()
@@ -1768,6 +1797,25 @@ class Main(QMainWindow):
         act(w, "Asset Browser", self.open_asset_browser, "Ctrl+B")
         act(w, "Entity Report", self.open_entity_report, "Ctrl+R")
         act(w, "Level Settings…", self.open_level_settings, "Ctrl+L")
+
+        m.aboutToShow.connect(self._refresh_recent_menus)
+
+    def _refresh_recent_menus(self):
+        def rebuild(menu, key, open_fn, empty_text):
+            menu.clear()
+            items = self._recent_list(key)
+            if not items:
+                placeholder = QAction(empty_text, self)
+                placeholder.setEnabled(False)
+                menu.addAction(placeholder)
+                return
+            for path in items:
+                a = QAction(self._recent_label(path), self)
+                a.setToolTip(path)
+                a.triggered.connect(lambda _=False, p=path, fn=open_fn: fn(p))
+                menu.addAction(a)
+        rebuild(self._recent_level_menu, 'recent_levels', self.open_recent_level, 'No recent levels')
+        rebuild(self._recent_multilevel_menu, 'recent_multilevels', self.open_recent_multilevel, 'No recent multilevels')
 
     def open_asset_browser(self):
         if getattr(self, "_browser", None) is None:
@@ -2087,7 +2135,18 @@ class Main(QMainWindow):
 
     def open_bin(self):
         fn, _ = QFileDialog.getOpenFileName(self, "Open level .bin", "", "Level (*.bin)")
-        if fn: self._load(fn)
+        if fn:
+            self._load(fn)
+            self._push_recent('recent_levels', fn)
+
+    def open_recent_level(self, fn):
+        if not fn or not os.path.isfile(fn):
+            self.statusBar().showMessage(f"recent level not found: {fn}")
+            return
+        if not self.confirm_level_switch():
+            return
+        self._load(fn)
+        self._push_recent('recent_levels', fn)
 
     def _load(self, fn):
         self.path = fn; self.level = read_level(fn)
@@ -2119,6 +2178,7 @@ class Main(QMainWindow):
         if not self.path: return self.save_bin_as()
         write_level(self.level, self.path); self.statusBar().showMessage(f"saved {self.path}")
         self._mark_level_saved()
+        self._push_recent('recent_levels', self.path)
         return True
     def save_bin_as(self):
         if not self.level: return False
@@ -2126,7 +2186,10 @@ class Main(QMainWindow):
         if not fn:
             return False
         self.path = fn
-        return self.save_bin()
+        ok = self.save_bin()
+        if ok:
+            self._push_recent('recent_levels', fn)
+        return ok
 
     def open_multilevel(self):
         fn, _ = QFileDialog.getOpenFileName(self, "Open multilevel", "", "Multilevel (*.xml)")
@@ -2134,7 +2197,25 @@ class Main(QMainWindow):
         try: ml = TM.MultiLevel(fn)
         except Exception as ex: self.statusBar().showMessage(f"not a multilevel: {ex}"); return
         self.mldock.load(ml, fn)
-        if ml.stages: self.load_stage(ml.stages[0]['name'], fn)
+        if ml.stages:
+            if not self.load_stage(ml.stages[0]['name'], fn):
+                return
+        self._push_recent('recent_multilevels', fn)
+
+    def open_recent_multilevel(self, fn):
+        if not fn or not os.path.isfile(fn):
+            self.statusBar().showMessage(f"recent multilevel not found: {fn}")
+            return
+        if not self.confirm_level_switch():
+            return
+        try: ml = TM.MultiLevel(fn)
+        except Exception as ex:
+            self.statusBar().showMessage(f"not a multilevel: {ex}"); return
+        self.mldock.load(ml, fn)
+        if ml.stages:
+            if not self.load_stage(ml.stages[0]['name'], fn):
+                return
+        self._push_recent('recent_multilevels', fn)
 
     def new_level(self):
         """Create a fresh blank .bin + .xml shell and open it for editing."""
@@ -2166,7 +2247,9 @@ class Main(QMainWindow):
         if not p:
             p, _ = QFileDialog.getOpenFileName(self, f"Locate {name}.bin", os.path.dirname(ml_path), "Level (*.bin)")
             if not p: return False
-        self._load(p); self.statusBar().showMessage(f"editing stage {name}")
+        self._load(p)
+        self._push_recent('recent_levels', p)
+        self.statusBar().showMessage(f"editing stage {name}")
         return True
 
     # ---- history ----
