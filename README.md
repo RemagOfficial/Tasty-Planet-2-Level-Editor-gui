@@ -3,8 +3,10 @@ A level editor for the game Tasty Planet 2 with graphics integration to allow re
 
 Will of course require Python to run. You will need to run `pip install PySide6 Pillow` first.
 
-Then to use, Open the folder containing all the Python files, click the directory bar at the top of the file explorer window and type 'cmd'. 
-Then simply type `python tp2editor.py` into the command prompt.
+Then to run the editor, you have two options:
+
+1. Double-click `run_editor.bat` (Windows).
+2. Open the folder containing all the Python files, click the directory bar at the top of File Explorer and type `cmd`, then run `python tp2editor.py`.
 
 
 Thank you to RemagOfficial for their Tasty Planet 2 level editor, found at
