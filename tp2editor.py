@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QFormLayout, QHBoxLayout, QLabel, QPushButton, QDoubleSpinBox, QSpinBox, QCheckBox,
     QListWidget, QListWidgetItem, QFileDialog, QColorDialog, QLineEdit, QStyle, QFrame,
     QDialog, QGridLayout, QComboBox, QScrollArea, QToolButton, QGraphicsItemGroup,
-    QTableWidget, QTableWidgetItem, QHeaderView, QMenu)
+    QTableWidget, QTableWidgetItem, QHeaderView, QMenu, QMessageBox)
 from PySide6.QtGui import (
     QPixmap, QImage, QColor, QPainter, QPen, QAction, QPainterPath, QFont, QPolygonF,
     QKeySequence, QIcon, QBrush)
@@ -954,9 +954,11 @@ class MultiLevelDock(QDockWidget):
     def __init__(self, win):
         super().__init__("Multilevel builder", win); self.win = win
         self.ml = None; self.ml_path = None; self.cur = None
+        self._restoring_selection = False
         w = QWidget(); col = QVBoxLayout(w); col.setSpacing(8)
         col.addWidget(QLabel("Stages  (the <level> array — top plays first)"))
         self.list = QListWidget()
+        self.list.setMinimumHeight(130)   # enough room for about 3 visible stage rows
         self.list.currentRowChanged.connect(self._select)
         self.list.itemDoubleClicked.connect(lambda *_: self._open())
         col.addWidget(self.list)
@@ -971,6 +973,7 @@ class MultiLevelDock(QDockWidget):
         col.addLayout(rowb)
         self.open_btn = QPushButton("Open selected stage in editor"); self.open_btn.clicked.connect(self._open)
         col.addWidget(self.open_btn)
+
         # per-stage params
         col.addWidget(self._hline()); col.addWidget(self._h("Selected stage"))
         self.sform = QFormLayout(); sc = QWidget(); sc.setLayout(self.sform); col.addWidget(sc)
@@ -984,7 +987,12 @@ class MultiLevelDock(QDockWidget):
         b2 = QPushButton("Save As…"); b2.clicked.connect(self._save_as); srow.addWidget(b2)
         col.addLayout(srow)
         col.addStretch(1)
-        _sc = QScrollArea(); _sc.setWidgetResizable(True); _sc.setWidget(w); self.setWidget(_sc)
+
+        # Keep the full dock scrollable when space is tight, while still allowing splitter resizing.
+        _sc = QScrollArea()
+        _sc.setWidgetResizable(True)
+        _sc.setWidget(w)
+        self.setWidget(_sc)
         self.stage_edits = {}; self.ml_edits = {}
 
     @staticmethod
@@ -1034,9 +1042,26 @@ class MultiLevelDock(QDockWidget):
 
     # ---- per-stage form ----
     def _select(self, idx):
+        if self._restoring_selection:
+            return
+        prev = self.cur
         self._commit_stage()                       # save edits from the previously-selected stage
         self.cur = idx if (self.ml and 0 <= idx < len(self.ml.stages)) else None
         self._build_stage_form()
+        if self.cur is None or not self.ml_path:
+            return
+        target = self.ml.stages[self.cur].get('name')
+        current = os.path.splitext(os.path.basename(self.win.path))[0] if self.win.path else None
+        if target == current:
+            return
+        if not self.win.load_stage(target, self.ml_path):
+            self._restoring_selection = True
+            self.list.blockSignals(True)
+            self.list.setCurrentRow(prev if prev is not None else -1)
+            self.list.blockSignals(False)
+            self._restoring_selection = False
+            self.cur = prev if (self.ml and prev is not None and 0 <= prev < len(self.ml.stages)) else None
+            self._build_stage_form()
 
     def _build_stage_form(self):
         while self.sform.rowCount(): self.sform.removeRow(0)
@@ -1571,6 +1596,7 @@ class Main(QMainWindow):
         self._last_path = None
         self.bg_editable = False
         self.history = []; self.hist_idx = -1
+        self._saved_level_state = None
         self._cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILE)
         self._cfg = self._load_config()
         saved_gfx = self._cfg.get('graphics_path')
@@ -1633,6 +1659,29 @@ class Main(QMainWindow):
             spr = self.assets.build_sprite(name, rgba, frame)
             self._pm[key] = pil_to_qpixmap(spr) if spr is not None else None
         return self._pm[key]
+
+    def _mark_level_saved(self):
+        self._saved_level_state = copy.deepcopy(self.level) if self.level is not None else None
+
+    def has_unsaved_level_changes(self):
+        return self.level is not None and self._saved_level_state is not None and self.level != self._saved_level_state
+
+    def confirm_level_switch(self):
+        if not self.has_unsaved_level_changes():
+            return True
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle("Unsaved changes")
+        msg.setText("The current level has unsaved changes.")
+        msg.setInformativeText("Do you want to save before loading another level?")
+        msg.setStandardButtons(QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
+        msg.setDefaultButton(QMessageBox.Save)
+        choice = msg.exec()
+        if choice == QMessageBox.Cancel:
+            return False
+        if choice == QMessageBox.Discard:
+            return True
+        return self.save_bin()
 
     def resolve_deco_names(self, layer):
         """type 0 inherits previous tile; type 1 -> tileTypes[cell]; type 2 -> inline string."""
@@ -2057,6 +2106,7 @@ class Main(QMainWindow):
         self._populate(refit=True)
         if self._onion_on:                                  # rebuild ghost for the newly-loaded stage
             self._load_onion_data(); self._refresh_onion()
+        self._mark_level_saved()
     def set_gfx(self):
         d = QFileDialog.getExistingDirectory(self, "Select assets/graphics folder", self.gfx)
         if not d: return
@@ -2065,13 +2115,18 @@ class Main(QMainWindow):
         if self.level: self._populate(refit=False)
 
     def save_bin(self):
-        if not self.level: return
+        if not self.level: return False
         if not self.path: return self.save_bin_as()
         write_level(self.level, self.path); self.statusBar().showMessage(f"saved {self.path}")
+        self._mark_level_saved()
+        return True
     def save_bin_as(self):
-        if not self.level: return
+        if not self.level: return False
         fn, _ = QFileDialog.getSaveFileName(self, "Save .bin", self.path or "", "Level (*.bin)")
-        if fn: self.path = fn; self.save_bin()
+        if not fn:
+            return False
+        self.path = fn
+        return self.save_bin()
 
     def open_multilevel(self):
         fn, _ = QFileDialog.getOpenFileName(self, "Open multilevel", "", "Multilevel (*.xml)")
@@ -2105,11 +2160,14 @@ class Main(QMainWindow):
             p = os.path.join(c, name + ".bin")
             if os.path.isfile(p): return p
     def load_stage(self, name, ml_path):
+        if not self.confirm_level_switch():
+            return False
         p = self._resolve_stage(name, ml_path)
         if not p:
             p, _ = QFileDialog.getOpenFileName(self, f"Locate {name}.bin", os.path.dirname(ml_path), "Level (*.bin)")
-            if not p: return
+            if not p: return False
         self._load(p); self.statusBar().showMessage(f"editing stage {name}")
+        return True
 
     # ---- history ----
     def commit(self):
