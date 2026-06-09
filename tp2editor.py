@@ -1098,7 +1098,7 @@ class MultiLevelDock(QDockWidget):
     # ---- array operations ----
     def _add_blank(self):
         if self.ml is None: self.win.statusBar().showMessage("open or start a multilevel first"); return
-        start = os.path.dirname(self.ml_path) if self.ml_path else ""
+        start = self.win._levels_dir()
         fn, _ = QFileDialog.getSaveFileName(self, "New blank level .bin", start, "Level (*.bin)")
         if not fn: return
         if not fn.lower().endswith(".bin"): fn += ".bin"
@@ -1113,7 +1113,7 @@ class MultiLevelDock(QDockWidget):
 
     def _add_existing(self):
         if self.ml is None: self.win.statusBar().showMessage("open or start a multilevel first"); return
-        start = os.path.dirname(self.ml_path) if self.ml_path else ""
+        start = self.win._levels_dir()
         fn, _ = QFileDialog.getOpenFileName(self, "Add existing level .bin", start, "Level (*.bin)")
         if not fn: return
         name = os.path.splitext(os.path.basename(fn))[0]
@@ -1157,7 +1157,7 @@ class MultiLevelDock(QDockWidget):
     def _save_as(self):
         if not self.ml: return
         self._flush()
-        start = self.ml_path or ""
+        start = self.ml_path or self.win._multilevels_dir()
         fn, _ = QFileDialog.getSaveFileName(self, "Save multilevel as", start, "Multilevel (*.xml)")
         if not fn: return
         if not fn.lower().endswith(".xml"): fn += ".xml"
@@ -1601,11 +1601,8 @@ class Main(QMainWindow):
         self._saved_level_state = None
         self._cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILE)
         self._cfg = self._load_config()
-        saved_gfx = self._cfg.get('graphics_path')
-        if isinstance(saved_gfx, str) and os.path.isdir(saved_gfx):
-            self.gfx = saved_gfx
-        else:
-            self.gfx = DEFAULT_GFX if os.path.isdir(DEFAULT_GFX) else os.getcwd()
+        self._assets_root = self._load_assets_root()
+        self.gfx = self._graphics_dir()
         self.assets = self._load_assets(); self._pm = {}
         self.scene = QGraphicsScene(self); self.view = Canvas(self.scene, self); self.setCentralWidget(self.view)
         self.inspector = Inspector(self); self.addDockWidget(Qt.RightDockWidgetArea, self.inspector)
@@ -1616,9 +1613,9 @@ class Main(QMainWindow):
 
     def _load_assets(self):
         # the game XMLs aren't all in one place: imagemaps/entities/animations usually live in
-        # assets/graphics, but strings.xml lives in assets/. Search each file across candidate dirs.
+        # assets/graphics, while level XMLs live in assets/levels. Search the assets tree first.
         seen = set(); cands = []
-        for d in (self.gfx, os.path.dirname(self.gfx), os.path.dirname(os.path.dirname(self.gfx)),
+        for d in (self._graphics_dir(), self._assets_root, self._levels_dir(), self._multilevels_dir(),
                   os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
             if d and d not in seen:
                 seen.add(d); cands.append(d)
@@ -1633,6 +1630,51 @@ class Main(QMainWindow):
         a = Assets(self.gfx, imagemaps=im, entities=find("entityintersections.xml"),
                    animations=find("animationdefs.xml"), strings=find("strings.xml"))
         return a
+
+    def _default_assets_root(self):
+        root = os.path.dirname(DEFAULT_GFX)
+        return root if os.path.isdir(root) else os.getcwd()
+
+    def _validate_assets_root(self, root):
+        return (isinstance(root, str) and os.path.isdir(root) and
+                os.path.isdir(os.path.join(root, 'graphics')) and
+                os.path.isdir(os.path.join(root, 'levels')))
+
+    def _graphics_dir(self):
+        return os.path.join(self._assets_root, 'graphics') if self._assets_root else os.getcwd()
+
+    def _levels_dir(self):
+        return os.path.join(self._assets_root, 'levels') if self._assets_root else os.getcwd()
+
+    def _multilevels_dir(self):
+        return os.path.join(self._levels_dir(), 'multilevels') if self._assets_root else os.getcwd()
+
+    def _load_assets_root(self):
+        saved_root = self._cfg.get('assets_root')
+        if self._validate_assets_root(saved_root):
+            if self._cfg.pop('graphics_path', None) is not None:
+                self._save_config()
+            return saved_root
+        legacy = self._cfg.get('graphics_path')
+        if self._validate_assets_root(legacy):
+            self._cfg.pop('graphics_path', None)
+            self._save_setting('assets_root', legacy)
+            return legacy
+        if saved_root or legacy:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Warning)
+            msg.setWindowTitle("Assets folder reset")
+            msg.setText("The saved assets folder is no longer valid for this editor.")
+            msg.setInformativeText("Please choose the game's assets folder again. The setting has been reset.")
+            msg.exec()
+        self._cfg.pop('graphics_path', None)
+        root = self._default_assets_root()
+        if self._validate_assets_root(root):
+            self._save_setting('assets_root', root)
+            return root
+        self._cfg.pop('assets_root', None)
+        self._save_config()
+        return os.getcwd()
 
     def _load_config(self):
         if not os.path.isfile(self._cfg_path):
@@ -1753,7 +1795,7 @@ class Main(QMainWindow):
         m.addSeparator()
         act(m, "New blank level…", self.new_level, "Ctrl+N")
         act(m, "New multilevel…", self.new_multilevel)
-        act(m, "Set graphics folder…", self.set_gfx); m.addSeparator()
+        act(m, "Set assets folder…", self.set_gfx); m.addSeparator()
         act(m, "Save .bin", self.save_bin, "Ctrl+S"); act(m, "Save .bin As…", self.save_bin_as)
         e = self.menuBar().addMenu("&Edit")
         act(e, "Undo", self.undo, QKeySequence.Undo)
@@ -2134,7 +2176,7 @@ class Main(QMainWindow):
         return (None, None, None)
 
     def open_bin(self):
-        fn, _ = QFileDialog.getOpenFileName(self, "Open level .bin", "", "Level (*.bin)")
+        fn, _ = QFileDialog.getOpenFileName(self, "Open level .bin", self._levels_dir(), "Level (*.bin)")
         if fn:
             self._load(fn)
             self._push_recent('recent_levels', fn)
@@ -2167,10 +2209,17 @@ class Main(QMainWindow):
             self._load_onion_data(); self._refresh_onion()
         self._mark_level_saved()
     def set_gfx(self):
-        d = QFileDialog.getExistingDirectory(self, "Select assets/graphics folder", self.gfx)
+        d = QFileDialog.getExistingDirectory(self, "Select game assets folder", self._assets_root)
         if not d: return
-        self.gfx = d; self.assets = self._load_assets(); self._pm.clear()
-        self._save_setting('graphics_path', d)
+        if not self._validate_assets_root(d):
+            QMessageBox.warning(self, "Invalid assets folder",
+                                "Choose the game's assets folder that contains both 'graphics' and 'levels'.")
+            return
+        self._assets_root = d
+        self.gfx = self._graphics_dir()
+        self._cfg.pop('graphics_path', None)
+        self.assets = self._load_assets(); self._pm.clear()
+        self._save_setting('assets_root', d)
         if self.level: self._populate(refit=False)
 
     def save_bin(self):
@@ -2182,7 +2231,7 @@ class Main(QMainWindow):
         return True
     def save_bin_as(self):
         if not self.level: return False
-        fn, _ = QFileDialog.getSaveFileName(self, "Save .bin", self.path or "", "Level (*.bin)")
+        fn, _ = QFileDialog.getSaveFileName(self, "Save .bin", self.path or self._levels_dir(), "Level (*.bin)")
         if not fn:
             return False
         self.path = fn
@@ -2192,7 +2241,7 @@ class Main(QMainWindow):
         return ok
 
     def open_multilevel(self):
-        fn, _ = QFileDialog.getOpenFileName(self, "Open multilevel", "", "Multilevel (*.xml)")
+        fn, _ = QFileDialog.getOpenFileName(self, "Open multilevel", self._multilevels_dir(), "Multilevel (*.xml)")
         if not fn: return
         try: ml = TM.MultiLevel(fn)
         except Exception as ex: self.statusBar().showMessage(f"not a multilevel: {ex}"); return
@@ -2219,7 +2268,7 @@ class Main(QMainWindow):
 
     def new_level(self):
         """Create a fresh blank .bin + .xml shell and open it for editing."""
-        fn, _ = QFileDialog.getSaveFileName(self, "New blank level .bin", "", "Level (*.bin)")
+        fn, _ = QFileDialog.getSaveFileName(self, "New blank level .bin", self._levels_dir(), "Level (*.bin)")
         if not fn: return
         if not fn.lower().endswith(".bin"): fn += ".bin"
         try:
@@ -2245,7 +2294,7 @@ class Main(QMainWindow):
             return False
         p = self._resolve_stage(name, ml_path)
         if not p:
-            p, _ = QFileDialog.getOpenFileName(self, f"Locate {name}.bin", os.path.dirname(ml_path), "Level (*.bin)")
+            p, _ = QFileDialog.getOpenFileName(self, f"Locate {name}.bin", self._levels_dir(), "Level (*.bin)")
             if not p: return False
         self._load(p)
         self._push_recent('recent_levels', p)
