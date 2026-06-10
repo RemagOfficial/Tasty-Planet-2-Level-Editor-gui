@@ -76,19 +76,19 @@ def blank_level_dict():
             'layers': [{'walls': [], 'paths': [], 'entities': [], 'decorations': []} for _ in range(5)]}
 
 def level_shell_xml(edges=(-1600.0, -1200.0, 1600.0, 1200.0), growthrate=0.25,
-                    goostart_area=2900, goo_xy=(0.0, 0.0)):
+                    goostart_area=0.003, goo_xy=(0.0, 0.0)):
     """The .xml shell paired with a level .bin (edges, layers, goo start)."""
     el, et, er, eb = edges; gx, gy = goo_xy
     return (
         f'<level sidescroll="false" waterlevel="0" '
         f'edgeleft="{el:.6f}" edgetop="{et:.6f}" edgeright="{er:.6f}" edgebottom="{eb:.6f}" '
-        f'growthrate="{float(growthrate):.6f}">\n'
+        f'growthrate="{float(growthrate):.6e}">\n'
         '    <elementengine>\n'
         '        <layer name="Background" sorteddraw="true" drawabove="false" parx="1.000000" pary="1.000000" />\n'
         '        <layer name="Background Front" sorteddraw="true" drawabove="false" parx="1.000000" pary="1.000000" />\n'
         '        <layer name="Main Bottom" sorteddraw="true" drawabove="false" parx="1.000000" pary="1.000000" />\n'
         '        <layer name="Main" sorteddraw="true" drawabove="false" parx="1.000000" pary="1.000000">\n'
-        f'            <goostart x="{gx:.6f}" y="{gy:.6f}" area="{int(goostart_area)}" '
+        f'            <goostart x="{gx:.6f}" y="{gy:.6f}" area="{float(goostart_area):.6e}" '
         'singleplayer="true" multiplayer1="true" multiplayer2="false" priority="1080" />\n'
         '        </layer>\n'
         '        <layer name="Unnamed Layer" sorteddraw="true" drawabove="false" parx="1.000000" pary="1.000000" />\n'
@@ -1583,6 +1583,56 @@ class AssetBrowser(QDialog):
         else: self.win.spawn_decoration(name, layer_idx=li)
 
 
+class NewLevelDialog(QDialog):
+    """Ask the user for level options before creating a new blank level."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New Blank Level"); self.setMinimumWidth(340)
+        form = QFormLayout(self)
+        form.setSpacing(10)
+
+        self.width_spin = QSpinBox()
+        self.width_spin.setRange(400, 32000); self.width_spin.setSingleStep(100)
+        self.width_spin.setValue(3200); self.width_spin.setSuffix(" px")
+        self.width_spin.setToolTip("Total width of the level boundary (pixels).")
+
+        self.height_spin = QSpinBox()
+        self.height_spin.setRange(400, 32000); self.height_spin.setSingleStep(100)
+        self.height_spin.setValue(2400); self.height_spin.setSuffix(" px")
+        self.height_spin.setToolTip("Total height of the level boundary (pixels).")
+
+        self.goo_edit = QLineEdit("3.000000e-003")
+        self.goo_edit.setToolTip("Starting goo area in m² (scientific notation). Controls the goo's initial size.")
+
+        self.growth_edit = QLineEdit("2.500000e-001")
+        self.growth_edit.setToolTip("How quickly the goo grows as it eats (growthrate, scientific notation).")
+
+        form.addRow("Level width",    self.width_spin)
+        form.addRow("Level height",   self.height_spin)
+        form.addRow("Goo start size", self.goo_edit)
+        form.addRow("Growth rate",    self.growth_edit)
+
+        btns = QHBoxLayout()
+        ok = QPushButton("Create"); ok.setDefault(True); ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel"); cancel.clicked.connect(self.reject)
+        btns.addStretch(1); btns.addWidget(ok); btns.addWidget(cancel)
+        form.addRow(btns)
+
+    @staticmethod
+    def _parse_sci(text, fallback):
+        try: return float(text.strip())
+        except (ValueError, TypeError): return fallback
+
+    def shell_kwargs(self):
+        w = self.width_spin.value(); h = self.height_spin.value()
+        hw = w / 2.0; hh = h / 2.0
+        return dict(
+            edges=(-hw, -hh, hw, hh),
+            goostart_area=self._parse_sci(self.goo_edit.text(), 0.003),
+            growthrate=self._parse_sci(self.growth_edit.text(), 0.25),
+        )
+
+
 class Main(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2293,11 +2343,15 @@ class Main(QMainWindow):
 
     def new_level(self):
         """Create a fresh blank .bin + .xml shell and open it for editing."""
+        dlg = NewLevelDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        shell_kw = dlg.shell_kwargs()
         fn, _ = QFileDialog.getSaveFileName(self, "New blank level .bin", self._levels_dir(), "Level (*.bin)")
         if not fn: return
         if not fn.lower().endswith(".bin"): fn += ".bin"
         try:
-            write_blank_level(fn)
+            write_blank_level(fn, **shell_kw)
         except Exception as ex:
             self.statusBar().showMessage(f"could not create level: {ex}"); return
         self._load(fn)
